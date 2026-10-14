@@ -18,12 +18,17 @@ const STYLE_CSS: &str = include_str!("../web/style.css");
 
 struct AppState {
     db_path: PathBuf,
-    versions: Vec<String>,
 }
 
 pub fn serve(db_path: PathBuf, addr: &str) -> Result<()> {
-    let versions = query::versions(&open(&db_path)?)?.into_iter().map(|v| v.tag).collect();
-    let state = Arc::new(AppState { db_path, versions });
+    // A missing database is expected while the first build runs: serve 503
+    // until it appears. One that exists but cannot be read is a real fault.
+    if db_path.exists() {
+        query::versions(&open(&db_path)?)?;
+    } else {
+        eprintln!("{} does not exist yet; answering 503 until it does", db_path.display());
+    }
+    let state = Arc::new(AppState { db_path });
     let app = Router::new()
         .route("/", get(|| async { asset("text/html; charset=utf-8", INDEX_HTML) }))
         .route(
@@ -41,6 +46,7 @@ pub fn serve(db_path: PathBuf, addr: &str) -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/api/search", get(search))
         .route("/api/function/{name}", get(function))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(state);
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -62,17 +68,50 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
-struct ApiError(anyhow::Error);
+/// Content-Security-Policy for the UI: everything from this origin, except the
+/// web fonts (Google Fonts) and the inline SVG favicon. `style-src-attr` allows the
+/// per-element colour variables the timeline sets.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; \
+    style-src-attr 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self' data:; \
+    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, CSP),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "strict-origin-when-cross-origin"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+    ] {
+        headers.insert(name, header::HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// An error answered to a client. Details go to the log, not the response.
+enum ApiError {
+    /// The database has not been built yet.
+    NotReady,
+    Internal(anyhow::Error),
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
+        match self {
+            ApiError::NotReady => {
+                (StatusCode::SERVICE_UNAVAILABLE, "the database is still being built").into_response()
+            }
+            ApiError::Internal(e) => {
+                eprintln!("error: {e:#}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        ApiError(e.into())
+        ApiError::Internal(e.into())
     }
 }
 
@@ -82,6 +121,9 @@ async fn with_db<T: Send + 'static>(
     f: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
 ) -> Result<T, ApiError> {
     let path = state.db_path.clone();
+    if !path.exists() {
+        return Err(ApiError::NotReady);
+    }
     Ok(tokio::task::spawn_blocking(move || f(&open(&path)?)).await??)
 }
 
@@ -113,12 +155,14 @@ async fn function(
     Path(name): Path<String>,
 ) -> Result<Json<FunctionResponse>, ApiError> {
     let lookup = name.clone();
-    let defs = with_db(&state, move |db| query::history(db, &lookup)).await?;
-    Ok(Json(FunctionResponse {
-        name,
-        versions: state.versions.clone(),
-        defs,
-    }))
+    // Read in one connection, so the release list and the history always come
+    // from the same database file, even while a rebuild swaps it.
+    let (versions, defs) = with_db(&state, move |db| {
+        let versions = query::versions(db)?.into_iter().map(|v| v.tag).collect();
+        Ok((versions, query::history(db, &lookup)?))
+    })
+    .await?;
+    Ok(Json(FunctionResponse { name, versions, defs }))
 }
 
 /// Ready when the database answers a query.

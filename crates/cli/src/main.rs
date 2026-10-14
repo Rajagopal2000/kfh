@@ -28,6 +28,10 @@ enum Command {
         /// Only process this many releases.
         #[arg(long)]
         limit: Option<usize>,
+        /// Replace an existing database even if the new one fails its checks
+        /// (fewer releases, or more than 1% fewer functions in a shared release).
+        #[arg(long)]
+        force: bool,
     },
     /// Show the signature history of a function.
     Show {
@@ -59,9 +63,13 @@ fn parse_version(s: &str) -> Result<(u32, u32), String> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Build { repo, db, since, limit } => {
-            history::build::build(&repo, &db, &history::build::Options { since, limit })
-        }
+        Command::Build {
+            repo,
+            db,
+            since,
+            limit,
+            force,
+        } => history::build::build(&repo, &db, &history::build::Options { since, limit, force }),
         Command::Show { name, db, json } => show(&name, &db, json),
         Command::Serve { db, addr } => serve::serve(db, &addr),
         Command::DumpSigs { file } => {

@@ -80,6 +80,8 @@ pub struct Options {
     pub since: (u32, u32),
     /// Stop after this many releases (for quick experiments).
     pub limit: Option<usize>,
+    /// Replace an existing database even if the new one fails `verify::check_replacement`.
+    pub force: bool,
 }
 
 /// Mainline release tags (`vX.Y`, no `-rc`) at or after `since`, oldest first.
@@ -351,6 +353,15 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
     tx.commit()?;
     db.execute_batch("ANALYZE; VACUUM;")?;
     drop(db);
+    if !opts.force
+        && let Err(e) = crate::verify::check_replacement(&tmp_path, Some(db_path))
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.context(format!(
+            "kept {}: the new database failed its checks",
+            db_path.display()
+        )));
+    }
     std::fs::rename(&tmp_path, db_path)?;
     Ok(())
 }
