@@ -24,6 +24,9 @@ cargo build --release
 ```
 
 To pick up a new release, run `git --git-dir=data/linux.git fetch --tags` and then `kfh build` again.
+`kfh build` does nothing when the database already has every release, and only one build of a database runs at a time.
+Before replacing an existing database it checks the new one: every release must still be present, no shared release may lose more than 1% of its functions, and a few functions every release defines must be there.
+If a build fails or is rejected, later runs on the same releases stop at once instead of repeating it; fix the cause and run `kfh build --force`.
 `kfh build --since 6.14 --limit 1` builds a single release in a few minutes, which is useful when testing changes.
 
 ## Container image

@@ -138,6 +138,23 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         opts.since.1
     );
 
+    // One build per database at a time: a manual run and the scheduled one
+    // would otherwise write the same temporary file.
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(db_path.with_extension("db.lock"))
+        .with_context(|| format!("creating the lock next to {}", db_path.display()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("another build of {} is running; nothing to do", db_path.display());
+            return Ok(());
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
+
     // A full build takes hours; skip it when the database already has exactly
     // these releases.
     if !opts.force && db_path.exists() {
@@ -152,6 +169,21 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
             return Ok(());
         }
     }
+
+    // A build that did not finish (it failed, was rejected, or was killed)
+    // leaves this marker naming the releases it tried. Retrying the same input
+    // on every schedule would cost hours each time for the same result.
+    let attempt_path = db_path.with_extension("db.attempt");
+    let attempt: String = tags.iter().map(|(t, _)| format!("{t}\n")).collect();
+    if !opts.force && std::fs::read_to_string(&attempt_path).is_ok_and(|previous| previous == attempt) {
+        anyhow::bail!(
+            "the last build of {}..{} did not finish (see {}); fix the cause and rerun with --force",
+            tags[0].0,
+            tags[tags.len() - 1].0,
+            attempt_path.display()
+        );
+    }
+    std::fs::write(&attempt_path, &attempt)?;
 
     // Build into a temporary file so a failed run never leaves a half-written database.
     let tmp_path = db_path.with_extension("db.tmp");
@@ -378,6 +410,8 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         )));
     }
     std::fs::rename(&tmp_path, db_path)?;
+    std::fs::remove_file(&attempt_path)?;
+    drop(lock);
     Ok(())
 }
 
