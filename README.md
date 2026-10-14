@@ -31,7 +31,8 @@ If a build fails or is rejected, later runs on the same releases retry it after 
 
 ## Container image
 
-CI publishes `ghcr.io/rajagopal2000/kfh:<commit sha>` for every commit on `main`.
+CI publishes `ghcr.io/rajagopal2000/kfh:<commit sha>` (the server) and `ghcr.io/rajagopal2000/kfh-builder:<commit sha>` for every commit on `main`.
+The builder image runs `deploy/build-db.sh`, which holds one lock on the volume while it fetches mainline tags and rebuilds the database, so two builds never overlap however they were started.
 The image holds only the `kfh` binary, runs as a non-root user, and works with a read-only root filesystem.
 It does not include the database, which is mounted at `/data/functions.db`:
 
