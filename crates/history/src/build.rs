@@ -75,6 +75,45 @@ CREATE TABLE macro_targets (
 CREATE INDEX macro_targets_def ON macro_targets(def_id);
 ";
 
+/// Failed builds are retried after 6 hours, then 12, and not after the third attempt.
+const MAX_ATTEMPTS: u32 = 3;
+const FIRST_RETRY_SECS: u64 = 6 * 3600;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    /// Build now; this is attempt number `attempt`.
+    Go { attempt: u32 },
+    /// A recent attempt on the same releases failed; try again after `until`.
+    Wait { until: u64 },
+    /// Every allowed attempt failed; only --force builds again.
+    GiveUp { attempts: u32 },
+}
+
+/// Decides whether to build, given the marker a failed attempt left behind
+/// (`attempts=N last=UNIX` followed by the release tags it tried).
+fn retry_decision(marker: Option<&str>, releases: &str, now: u64, force: bool) -> Retry {
+    let previous = marker.and_then(|m| {
+        let (header, tried) = m.split_once('\n')?;
+        let mut fields = header.split(' ');
+        let attempts: u32 = fields.next()?.strip_prefix("attempts=")?.parse().ok()?;
+        let last: u64 = fields.next()?.strip_prefix("last=")?.parse().ok()?;
+        (tried == releases).then_some((attempts, last))
+    });
+    match previous {
+        None => Retry::Go { attempt: 1 },
+        Some((attempts, _)) if force => Retry::Go { attempt: attempts + 1 },
+        Some((attempts, _)) if attempts >= MAX_ATTEMPTS => Retry::GiveUp { attempts },
+        Some((attempts, last)) => {
+            let until = last + FIRST_RETRY_SECS * 2u64.pow(attempts.saturating_sub(1));
+            if now < until {
+                Retry::Wait { until }
+            } else {
+                Retry::Go { attempt: attempts + 1 }
+            }
+        }
+    }
+}
+
 pub struct Options {
     /// Oldest release to include, as (major, minor).
     pub since: (u32, u32),
@@ -178,19 +217,35 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
     }
 
     // A build that did not finish (it failed, was rejected, or was killed)
-    // leaves this marker naming the releases it tried. Retrying the same input
-    // on every schedule would cost hours each time for the same result.
+    // leaves a marker naming the releases it tried and how often. Retrying the
+    // same input on every hourly run would cost hours each time, so retries
+    // back off and stop after a few attempts.
     let attempt_path = db_path.with_extension("db.attempt");
-    let attempt: String = tags.iter().map(|(t, _)| format!("{t}\n")).collect();
-    if !opts.force && std::fs::read_to_string(&attempt_path).is_ok_and(|previous| previous == attempt) {
-        anyhow::bail!(
-            "the last build of {}..{} did not finish (see {}); fix the cause and rerun with --force",
+    let releases: String = tags.iter().map(|(t, _)| format!("{t}\n")).collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let previous = std::fs::read_to_string(&attempt_path).ok();
+    let attempts = match retry_decision(previous.as_deref(), &releases, now, opts.force) {
+        Retry::Go { attempt } => attempt,
+        Retry::Wait { until } => {
+            eprintln!(
+                "the last build of {}..{} failed; retrying after {} (unix time), see {}",
+                tags[0].0,
+                tags[tags.len() - 1].0,
+                until,
+                attempt_path.display()
+            );
+            return Ok(());
+        }
+        Retry::GiveUp { attempts } => anyhow::bail!(
+            "the build of {}..{} failed {attempts} times; fix the cause and rerun with --force (see {})",
             tags[0].0,
             tags[tags.len() - 1].0,
             attempt_path.display()
-        );
-    }
-    std::fs::write(&attempt_path, &attempt)?;
+        ),
+    };
+    std::fs::write(&attempt_path, format!("attempts={attempts} last={now}\n{releases}"))?;
 
     // Build into a temporary file so a failed run never leaves a half-written database.
     let tmp_path = db_path.with_extension("db.tmp");
@@ -581,6 +636,46 @@ fn origin_files(origin: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::origin_files;
+
+    #[test]
+    fn failed_builds_back_off_then_give_up() {
+        use super::{Retry, retry_decision};
+        let rel = "v7.1\nv7.2\n";
+        let marker = |n: u32, last: u64| format!("attempts={n} last={last}\n{rel}");
+        assert_eq!(retry_decision(None, rel, 100, false), Retry::Go { attempt: 1 });
+        // Another set of releases (a new tag arrived): start over.
+        assert_eq!(
+            retry_decision(Some(&marker(3, 0)), "v7.1\n", 100, false),
+            Retry::Go { attempt: 1 }
+        );
+        let h = 3600;
+        assert_eq!(
+            retry_decision(Some(&marker(1, 0)), rel, 5 * h, false),
+            Retry::Wait { until: 6 * h }
+        );
+        assert_eq!(
+            retry_decision(Some(&marker(1, 0)), rel, 6 * h, false),
+            Retry::Go { attempt: 2 }
+        );
+        assert_eq!(
+            retry_decision(Some(&marker(2, 0)), rel, 11 * h, false),
+            Retry::Wait { until: 12 * h }
+        );
+        assert_eq!(
+            retry_decision(Some(&marker(2, 0)), rel, 12 * h, false),
+            Retry::Go { attempt: 3 }
+        );
+        assert_eq!(
+            retry_decision(Some(&marker(3, 0)), rel, 1000 * h, false),
+            Retry::GiveUp { attempts: 3 }
+        );
+        assert_eq!(
+            retry_decision(Some(&marker(3, 0)), rel, 0, true),
+            Retry::Go { attempt: 4 }
+        );
+        // A corrupt marker does not block building.
+        assert_eq!(retry_decision(Some("garbage"), rel, 0, false), Retry::Go { attempt: 1 });
+    }
 
     #[test]
     fn origin_files_drop_line_numbers() {
