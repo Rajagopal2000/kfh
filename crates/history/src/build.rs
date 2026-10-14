@@ -138,6 +138,21 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         opts.since.1
     );
 
+    // A full build takes hours; skip it when the database already has exactly
+    // these releases.
+    if !opts.force && db_path.exists() {
+        let wanted: Vec<&str> = tags.iter().map(|(t, _)| t.as_str()).collect();
+        if crate::verify::release_tags(db_path)? == wanted {
+            eprintln!(
+                "{} already covers {}..{}; nothing to do",
+                db_path.display(),
+                wanted[0],
+                wanted[wanted.len() - 1]
+            );
+            return Ok(());
+        }
+    }
+
     // Build into a temporary file so a failed run never leaves a half-written database.
     let tmp_path = db_path.with_extension("db.tmp");
     let _ = std::fs::remove_file(&tmp_path);

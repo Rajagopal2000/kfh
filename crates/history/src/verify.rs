@@ -47,6 +47,11 @@ pub fn check_replacement(candidate: &Path, current: Option<&Path>) -> Result<()>
     Ok(())
 }
 
+/// Release tags in a database, oldest first.
+pub fn release_tags(path: &Path) -> Result<Vec<String>> {
+    tags(&open(path)?)
+}
+
 fn open(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening {}", path.display()))
