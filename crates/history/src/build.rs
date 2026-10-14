@@ -126,6 +126,13 @@ struct OpenSpan {
 }
 
 pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
+    // libgit2 refuses repositories owned by another user (git's safe.directory
+    // check). That check stops git from running commands a hostile repository's
+    // config asks for; kfh only reads objects, and libgit2 runs no hooks or
+    // config commands, so the owner of the clone does not matter here (in a
+    // container it often differs from the user kfh runs as).
+    // SAFETY: called before any repository is opened, from a single thread.
+    unsafe { git2::opts::set_verify_owner_validation(false)? };
     let repo = Repository::open(repo_path).with_context(|| format!("opening {}", repo_path.display()))?;
     let mut tags = release_tags(&repo, opts.since)?;
     if let Some(limit) = opts.limit {
