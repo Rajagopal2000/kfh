@@ -1,0 +1,50 @@
+name: Monitor
+
+# Checks the public site from outside the cluster. GitHub emails the repository
+# owner when a scheduled run fails, which is the alert for a server that is down
+# or a database that stopped keeping up with mainline releases.
+# Runs only when the repository variable MONITOR_ENABLED is "true".
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: vars.MONITOR_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SITE: https://kfh.rajagopaliyer.com
+      # A new release takes about 5 hours to build; allow for retries.
+      GRACE_HOURS: 48
+    steps:
+      - name: The server answers
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$SITE/healthz")
+          if [ "$code" != 200 ]; then
+            echo "::error::$SITE/healthz returned HTTP $code"
+            exit 1
+          fi
+      - name: The database has the newest mainline release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          served=$(curl -sf --max-time 30 "$SITE/api/status" | jq -r .latest)
+          upstream=$(git ls-remote --tags --refs https://github.com/torvalds/linux.git 'v*' \
+            | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ "$served" = "$upstream" ]; then
+            echo "up to date: $served"
+            exit 0
+          fi
+          tagged=$(gh api "repos/torvalds/linux/commits/$upstream" --jq .commit.committer.date)
+          hours=$(( ($(date +%s) - $(date -d "$tagged" +%s)) / 3600 ))
+          echo "serving $served; $upstream was tagged $hours hours ago"
+          if [ "$hours" -ge "$GRACE_HOURS" ]; then
+            echo "::error::$SITE still serves $served, $hours hours after $upstream; see the build-db CronJob in namespace kfh"
+            exit 1
+          fi

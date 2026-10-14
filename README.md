@@ -41,6 +41,21 @@ docker run --read-only -p 7878:7878 -v "$PWD/data/functions.db:/data/functions.d
 
 `/healthz` returns `ok` once the database answers a query, and the server finishes in-flight requests before exiting on `SIGTERM`.
 
+## Running in Kubernetes
+
+The deployment lives in the homelab's GitOps repository (`applications/kfh`).
+An hourly CronJob, `build-db`, fetches mainline tags and rebuilds the database when a new release appears; the server answers 503 until the first build finishes.
+A failed build is retried after 6 hours, then 12, and given up after the third attempt.
+To rebuild after fixing the cause, run the suspended `build-db-force` CronJob once:
+
+```sh
+kubectl -n kfh create job --from=cronjob/build-db-force build-db-force-$(date +%s)
+```
+
+The `Monitor` workflow checks the public site every hour from GitHub, and GitHub emails the repository owner when it fails.
+It fails when `/healthz` does not answer 200, or when the site still lacks a mainline release 48 hours after it was tagged.
+It runs only while the repository variable `MONITOR_ENABLED` is `true`.
+
 ## Layout
 
 - `crates/extract` parses unpreprocessed kernel C with tree-sitter.

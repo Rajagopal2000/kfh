@@ -44,6 +44,7 @@ pub fn serve(db_path: PathBuf, addr: &str) -> Result<()> {
             get(|| async { asset("text/css; charset=utf-8", STYLE_CSS) }),
         )
         .route("/healthz", get(healthz))
+        .route("/api/status", get(status))
         .route("/api/search", get(search))
         .route("/api/function/{name}", get(function))
         .layer(axum::middleware::map_response(security_headers))
@@ -192,4 +193,20 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     eprintln!("shutting down");
+}
+
+#[derive(Serialize)]
+struct Status {
+    /// Newest release in the database, e.g. `v7.2`.
+    latest: String,
+    releases: usize,
+}
+
+/// What the database covers, so monitoring can tell whether rebuilds keep up.
+async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, ApiError> {
+    let versions = with_db(&state, query::versions).await?;
+    Ok(Json(Status {
+        latest: versions.last().map(|v| v.tag.clone()).unwrap_or_default(),
+        releases: versions.len(),
+    }))
 }
