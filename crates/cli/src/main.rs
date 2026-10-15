@@ -4,6 +4,7 @@ use history::query::{self, Change};
 use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
 
+mod pages;
 mod serve;
 
 /// Kernel function history: how function signatures evolved across Linux releases.
@@ -49,6 +50,9 @@ enum Command {
         db: PathBuf,
         #[arg(long, default_value = "127.0.0.1:7878")]
         addr: String,
+        /// Public origin used in canonical URLs and the sitemap.
+        #[arg(long, default_value = "https://kfh.rajagopaliyer.com")]
+        public_url: String,
     },
     /// Print the functions a single source file defines (for debugging the extractor).
     DumpSigs { file: PathBuf },
@@ -72,7 +76,7 @@ fn main() -> Result<()> {
             force,
         } => history::build::build(&repo, &db, &history::build::Options { since, limit, force }),
         Command::Show { name, db, json } => show(&name, &db, json),
-        Command::Serve { db, addr } => serve::serve(db, &addr),
+        Command::Serve { db, addr, public_url } => serve::serve(db, &addr, &public_url),
         Command::DumpSigs { file } => {
             let src = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             for f in extract::extract(&src) {

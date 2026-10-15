@@ -1,26 +1,70 @@
-//! `kfh serve`: JSON API plus the embedded single-page UI.
+//! `kfh serve`: server-rendered pages (see `pages`), crawl files and the JSON API.
 
+use crate::pages::{self, Site};
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use history::query;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLE_CSS: &str = include_str!("../web/style.css");
+const FONTS: &[(&str, &[u8])] = &[
+    (
+        "ibm-plex-sans.woff2",
+        include_bytes!("../web/fonts/ibm-plex-sans.woff2"),
+    ),
+    (
+        "ibm-plex-mono-400.woff2",
+        include_bytes!("../web/fonts/ibm-plex-mono-400.woff2"),
+    ),
+    (
+        "ibm-plex-mono-500.woff2",
+        include_bytes!("../web/fonts/ibm-plex-mono-500.woff2"),
+    ),
+    (
+        "ibm-plex-mono-600.woff2",
+        include_bytes!("../web/fonts/ibm-plex-mono-600.woff2"),
+    ),
+];
+const FONT_LICENSE: &str = include_str!("../web/fonts/OFL.txt");
+
+/// Pages can be cached briefly (Cloudflare, browsers); assets whose URL
+/// carries a content hash, for a year.
+const PAGE_CACHE: &str = "public, max-age=600";
+const ASSET_CACHE: &str = "public, max-age=31536000, immutable";
 
 struct AppState {
     db_path: PathBuf,
+    origin: String,
+    css_url: String,
+    js_url: String,
 }
 
-pub fn serve(db_path: PathBuf, addr: &str) -> Result<()> {
+impl AppState {
+    fn site(&self) -> Site<'_> {
+        Site {
+            origin: &self.origin,
+            css: &self.css_url,
+            js: &self.js_url,
+        }
+    }
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+pub fn serve(db_path: PathBuf, addr: &str, origin: &str) -> Result<()> {
     // A missing database is expected while the first build runs: serve 503
     // until it appears. One that exists but cannot be read is a real fault.
     if db_path.exists() {
@@ -28,13 +72,19 @@ pub fn serve(db_path: PathBuf, addr: &str) -> Result<()> {
     } else {
         eprintln!("{} does not exist yet; answering 503 until it does", db_path.display());
     }
-    let state = Arc::new(AppState { db_path });
+    let state = Arc::new(AppState {
+        db_path,
+        origin: origin.trim_end_matches('/').to_string(),
+        css_url: format!("/style.css?v={}", content_hash(STYLE_CSS.as_bytes())),
+        js_url: format!("/app.js?v={}", content_hash(APP_JS.as_bytes())),
+    });
     let app = Router::new()
-        .route("/", get(|| async { asset("text/html; charset=utf-8", INDEX_HTML) }))
-        .route(
-            "/f/{name}",
-            get(|| async { asset("text/html; charset=utf-8", INDEX_HTML) }),
-        )
+        .route("/", get(landing))
+        .route("/f/{name}", get(function_page))
+        .route("/search", get(search_page))
+        .route("/robots.txt", get(robots))
+        .route("/sitemap.xml", get(sitemap_index))
+        .route("/sitemaps/{file}", get(sitemap))
         .route(
             "/app.js",
             get(|| async { asset("text/javascript; charset=utf-8", APP_JS) }),
@@ -43,6 +93,7 @@ pub fn serve(db_path: PathBuf, addr: &str) -> Result<()> {
             "/style.css",
             get(|| async { asset("text/css; charset=utf-8", STYLE_CSS) }),
         )
+        .route("/fonts/{file}", get(font))
         .route("/healthz", get(healthz))
         .route("/api/status", get(status))
         .route("/api/search", get(search))
@@ -66,15 +117,168 @@ fn open(path: &PathBuf) -> Result<Connection> {
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
-    ([(header::CONTENT_TYPE, content_type)], body).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, ASSET_CACHE),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn font(Path(file): Path<String>) -> Response {
+    if file == "OFL.txt" {
+        return ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], FONT_LICENSE).into_response();
+    }
+    match FONTS.iter().find(|(name, _)| *name == file) {
+        Some((_, bytes)) => (
+            [
+                (header::CONTENT_TYPE, "font/woff2"),
+                (header::CACHE_CONTROL, ASSET_CACHE),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn page(status: StatusCode, markup: maud::Markup) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, PAGE_CACHE)],
+        Html(markup.into_string()),
+    )
+        .into_response()
+}
+
+async fn landing(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let (versions, names) = with_db(&state, |db| Ok((query::versions(db)?, query::name_count(db)?))).await?;
+    Ok(page(StatusCode::OK, pages::landing(&state.site(), &versions, names)))
+}
+
+async fn function_page(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Result<Response, ApiError> {
+    let lookup = name.clone();
+    let (versions, defs, suggestions) = with_db(&state, move |db| {
+        let versions = query::versions(db)?;
+        let defs = query::history(db, &lookup)?;
+        let suggestions = if defs.is_empty() {
+            suggest(db, &lookup)?
+        } else {
+            Vec::new()
+        };
+        Ok((versions, defs, suggestions))
+    })
+    .await?;
+    if defs.is_empty() {
+        return Ok(page(
+            StatusCode::NOT_FOUND,
+            pages::not_found(&state.site(), &name, &versions, &suggestions),
+        ));
+    }
+    Ok(page(
+        StatusCode::OK,
+        pages::function(&state.site(), &name, &versions, defs),
+    ))
+}
+
+/// Names sharing the longest prefix with `name` that any name has.
+fn suggest(db: &Connection, name: &str) -> Result<Vec<String>> {
+    let chars: Vec<char> = name.chars().collect();
+    for len in (3..chars.len()).rev() {
+        let prefix: String = chars[..len].iter().collect();
+        let found = query::search(db, &prefix, 20)?;
+        if !found.is_empty() {
+            return Ok(found);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// The search form without JavaScript: an exact name goes to its page.
+async fn search_page(State(state): State<Arc<AppState>>, Query(p): Query<SearchParams>) -> Result<Response, ApiError> {
+    let q = p.q.trim().to_string();
+    if q.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+    let lookup = q.clone();
+    let (versions, exact, suggestions) = with_db(&state, move |db| {
+        let exact = query::search(db, &lookup, 1)?.first().is_some_and(|n| *n == lookup);
+        let suggestions = if exact { Vec::new() } else { suggest(db, &lookup)? };
+        Ok((query::versions(db)?, exact, suggestions))
+    })
+    .await?;
+    if exact {
+        let url: String = format!(
+            "/f/{}",
+            q.bytes()
+                .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                })
+                .collect::<String>()
+        );
+        return Ok(Redirect::to(&url).into_response());
+    }
+    Ok(page(
+        StatusCode::NOT_FOUND,
+        pages::not_found(&state.site(), &q, &versions, &suggestions),
+    ))
+}
+
+async fn robots(State(state): State<Arc<AppState>>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        pages::robots(&state.origin),
+    )
+        .into_response()
+}
+
+fn xml(body: String) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn sitemap_index(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let (names, versions) = with_db(&state, |db| Ok((query::name_count(db)?, query::versions(db)?))).await?;
+    let lastmod = versions
+        .last()
+        .map(|v| pages::iso_date(v.commit_time))
+        .unwrap_or_default();
+    Ok(xml(pages::sitemap_index(&state.origin, names, &lastmod)))
+}
+
+async fn sitemap(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Result<Response, ApiError> {
+    let Some(n) = file.strip_suffix(".xml").and_then(|n| n.parse::<usize>().ok()) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let entries = with_db(&state, move |db| {
+        query::names_page(db, n * pages::SITEMAP_PAGE, pages::SITEMAP_PAGE)
+    })
+    .await?;
+    if entries.is_empty() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(xml(pages::sitemap(&state.origin, &entries, n == 0)))
 }
 
 /// Content-Security-Policy for the UI: everything from this origin, except the
 /// web fonts (Google Fonts) and the inline SVG favicon. `style-src-attr` allows the
 /// per-element colour variables the timeline sets.
-const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; \
-    style-src-attr 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self' data:; \
-    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+    style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' data:; \
+    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 async fn security_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();

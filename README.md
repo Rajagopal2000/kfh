@@ -69,7 +69,10 @@ It runs only while the repository variable `MONITOR_ENABLED` is `true`.
 - `crates/history` builds the SQLite database and answers queries, including the signature diff and move detection.
   It parses each unique file blob once and stores consecutive releases with the same signature as one span.
   Expansion results are cached across releases and reused only while every macro definition they depend on is unchanged.
-- `crates/cli` holds the `kfh` binary and the web UI it serves (`web/`).
+- `crates/cli` holds the `kfh` binary and the site it serves.
+  `pages.rs` renders every page on the server, so search engines see each function's full history; `web/app.js` only adds search-as-you-type and tooltips, and the site works without it.
+  The server also serves `robots.txt` and a sitemap index (`/sitemap.xml`) listing every function page with the date of its last change.
+  Fonts (IBM Plex, SIL Open Font License) are served from the site itself.
 - `validation/` checks the database against a real kernel build, as described below.
 
 ## Rules for macro expansion

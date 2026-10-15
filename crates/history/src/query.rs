@@ -9,6 +9,8 @@ use serde::Serialize;
 pub struct Version {
     pub ord: i64,
     pub tag: String,
+    /// Commit time of the release tag, in seconds since the Unix epoch.
+    pub commit_time: i64,
 }
 
 /// The history of one function name within one file.
@@ -179,13 +181,34 @@ pub enum Change {
 }
 
 pub fn versions(db: &Connection) -> Result<Vec<Version>> {
-    let mut stmt = db.prepare("SELECT ord, tag FROM versions ORDER BY ord")?;
+    let mut stmt = db.prepare("SELECT ord, tag, commit_time FROM versions ORDER BY ord")?;
     let rows = stmt.query_map([], |r| {
         Ok(Version {
             ord: r.get(0)?,
             tag: r.get(1)?,
+            commit_time: r.get(2)?,
         })
     })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Number of distinct names with a history page.
+pub fn name_count(db: &Connection) -> Result<usize> {
+    Ok(db.query_row("SELECT COUNT(DISTINCT name) FROM defs", [], |r| r.get::<_, i64>(0))? as usize)
+}
+
+/// Names in alphabetical order from `offset`, each with the commit time of
+/// the latest release in which anything about it changed.
+pub fn names_page(db: &Connection, offset: usize, limit: usize) -> Result<Vec<(String, i64)>> {
+    let mut stmt = db.prepare(
+        "WITH names AS (SELECT DISTINCT name FROM defs ORDER BY name LIMIT ?1 OFFSET ?2)
+         SELECT n.name, MAX(v.commit_time) FROM names n
+         JOIN defs d ON d.name = n.name
+         JOIN spans s ON s.def_id = d.id
+         JOIN versions v ON v.ord = s.first_ord
+         GROUP BY n.name ORDER BY n.name",
+    )?;
+    let rows = stmt.query_map(params![limit as i64, offset as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
