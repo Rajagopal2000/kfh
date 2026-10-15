@@ -25,19 +25,22 @@ cargo build --release
 
 To pick up a new release, run `git --git-dir=data/linux.git fetch --tags` and then `kfh build` again.
 `kfh build` does nothing when the database already has every release, and only one build of a database runs at a time.
+Next to the database it keeps `functions.state.db`, the history before macros are pruned, and a later build adds only the new releases to it, which takes a few minutes.
+It starts from scratch with `--force`, or when the state was written by a different version of the extraction code (a fingerprint of `crates/extract`, the history builder and `Cargo.lock` is compiled into `kfh`).
 Before replacing an existing database it checks the new one: every release must still be present, no shared release may lose more than 1% of its functions, and a few functions every release defines must be there.
-If a build fails or is rejected, later runs on the same releases retry it after 6 hours and then after 12, and give up after the third attempt; after that, fix the cause and run `kfh build --force`.
+If a build fails or is rejected, later runs on the same releases retry it after 6 hours and then after 12, and give up after the third attempt; after that, fix the cause and run `kfh build --force`, which rebuilds every release.
 `kfh build --since 6.14 --limit 1` builds a single release in a few minutes, which is useful when testing changes.
 
 ## Container image
 
 CI publishes `ghcr.io/rajagopal2000/kfh:<commit sha>` (the server) and `ghcr.io/rajagopal2000/kfh-builder:<commit sha>` for every commit on `main`.
-The builder image runs `deploy/build-db.sh`, which holds one lock on the volume while it fetches mainline tags and rebuilds the database, so two builds never overlap however they were started.
-The image holds only the `kfh` binary, runs as a non-root user, and works with a read-only root filesystem.
-It does not include the database, which is mounted at `/data/functions.db`:
+The builder image runs `deploy/build-db.sh`, which holds one lock on the volume while it fetches mainline tags and updates the database, so two builds never overlap however they were started.
+The image is built for `linux/amd64` (on an Apple silicon Mac, add `--platform linux/amd64`).
+It holds only the `kfh` binary, runs as a non-root user, and works with a read-only root filesystem.
+It does not include the database, which is mounted at `/work/live/functions.db`:
 
 ```sh
-docker run --read-only -p 7878:7878 -v "$PWD/data/functions.db:/data/functions.db:ro" ghcr.io/rajagopal2000/kfh:<sha>
+docker run --read-only -p 7878:7878 -v "$PWD/data/functions.db:/work/live/functions.db:ro" ghcr.io/rajagopal2000/kfh:<sha>
 ```
 
 `/healthz` returns `ok` once the database answers a query, and the server finishes in-flight requests before exiting on `SIGTERM`.
@@ -45,7 +48,7 @@ docker run --read-only -p 7878:7878 -v "$PWD/data/functions.db:/data/functions.d
 ## Running in Kubernetes
 
 The deployment lives in the homelab's GitOps repository (`applications/kfh`).
-An hourly CronJob, `build-db`, fetches mainline tags and rebuilds the database when a new release appears; the server answers 503 until the first build finishes.
+An hourly CronJob, `build-db`, fetches mainline tags and adds each new release to the database; the server answers 503 until the first build finishes.
 A failed build is retried after 6 hours, then 12, and given up after the third attempt.
 To rebuild after fixing the cause, run the suspended `build-db-force` CronJob once:
 

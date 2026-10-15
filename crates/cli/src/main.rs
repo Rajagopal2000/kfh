@@ -29,9 +29,9 @@ enum Command {
         /// Only process this many releases.
         #[arg(long)]
         limit: Option<usize>,
-        /// Rebuild even if the database already has every release, and replace it
-        /// even if the new one fails its checks (fewer releases, or more than 1%
-        /// fewer functions in a shared release).
+        /// Rebuild every release from scratch, even if the database already has
+        /// them all, and replace it even if the new one fails its checks (fewer
+        /// releases, or more than 1% fewer functions in a shared release).
         #[arg(long)]
         force: bool,
     },

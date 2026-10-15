@@ -201,8 +201,7 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
     }
 
-    // A full build takes hours; skip it when the database already has exactly
-    // these releases.
+    // Skip the build when the database already has exactly these releases.
     if !opts.force && db_path.exists() {
         let wanted: Vec<&str> = tags.iter().map(|(t, _)| t.as_str()).collect();
         if crate::verify::release_tags(db_path)? == wanted {
@@ -247,26 +246,228 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
     };
     std::fs::write(&attempt_path, format!("attempts={attempts} last={now}\n{releases}"))?;
 
-    // Build into a temporary file so a failed run never leaves a half-written database.
+    // The build state is the database before macros are pruned. Pruning keeps
+    // a macro only if its name is a function in some release, so it has to be
+    // redone over the whole history whenever a release is added.
+    //
+    // Both files are written to temporary paths, so a failed run never leaves
+    // a half-written state or database.
+    let state_path = db_path.with_extension("state.db");
+    let state_tmp = db_path.with_extension("state.db.tmp");
+    let _ = std::fs::remove_file(&state_tmp);
+    let wanted: Vec<&str> = tags.iter().map(|(t, _)| t.as_str()).collect();
+    eprintln!("extraction code fingerprint {FINGERPRINT}");
+    let resume = if opts.force {
+        None
+    } else {
+        resumable(&state_path, &wanted)?
+    };
+    if resume.is_some() {
+        std::fs::copy(&state_path, &state_tmp)
+            .with_context(|| format!("copying {} to {}", state_path.display(), state_tmp.display()))?;
+    }
+    let mut db = Connection::open(&state_tmp)?;
+    db.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
+    let tx = db.transaction()?;
+    let (mut state, first_new) = match resume {
+        Some(have) => {
+            eprintln!(
+                "resuming from {}, which covers {}..{}",
+                state_path.display(),
+                wanted[0],
+                wanted[have - 1]
+            );
+            (State::resume(&tx, have as i64 - 1)?, have)
+        }
+        None => {
+            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(STATE_SCHEMA)?;
+            (State::default(), 0)
+        }
+    };
+    for (ord, (tag, _)) in tags.iter().enumerate().skip(first_new) {
+        state.add_version(&tx, &repo, repo_path, ord as i64, tag)?;
+    }
+    state.finish(&tx, tags.len() as i64 - 1)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO build_meta (key, value) VALUES ('fingerprint', ?1)",
+        [FINGERPRINT],
+    )?;
+    tx.commit()?;
+    drop(db);
+
     let tmp_path = db_path.with_extension("db.tmp");
     let _ = std::fs::remove_file(&tmp_path);
+    std::fs::copy(&state_tmp, &tmp_path)
+        .with_context(|| format!("copying {} to {}", state_tmp.display(), tmp_path.display()))?;
     let mut db = Connection::open(&tmp_path)?;
     db.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
-    db.execute_batch(SCHEMA)?;
     let tx = db.transaction()?;
+    tx.execute_batch("DROP TABLE build_meta")?;
+    prune_macros(&tx)?;
+    tx.commit()?;
+    db.execute_batch("ANALYZE; VACUUM;")?;
+    drop(db);
+    if !opts.force
+        && let Err(e) = crate::verify::check_replacement(&tmp_path, Some(db_path))
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_file(&state_tmp);
+        return Err(e.context(format!(
+            "kept {}: the new database failed its checks",
+            db_path.display()
+        )));
+    }
+    std::fs::rename(&tmp_path, db_path)?;
+    std::fs::rename(&state_tmp, &state_path)?;
+    std::fs::remove_file(&attempt_path)?;
+    drop(lock);
+    Ok(())
+}
 
-    let mut sig_ids: HashMap<String, i64> = HashMap::new();
-    let mut def_ids: HashMap<(String, Arc<str>), i64> = HashMap::new();
-    let mut open: HashMap<(i64, i64), OpenSpan> = HashMap::new();
-    let mut cache: HashMap<Oid, Arc<Blob>> = HashMap::new();
-    let mut gen_memo: HashMap<MemoKey, Arc<Generated>> = HashMap::new();
-    let mut calls_memo: HashMap<MemoKey, Arc<Calls>> = HashMap::new();
-    let mut ever_functions: HashSet<String> = HashSet::new();
-    // (macro def, targets JSON) -> first version.
-    let mut open_targets: HashMap<(i64, String), i64> = HashMap::new();
+/// Identifies the code that decides what a build writes (see `build.rs`).
+const FINGERPRINT: &str = env!("KFH_BUILD_FINGERPRINT");
 
-    for (ord, (tag, _)) in tags.iter().enumerate() {
-        let ord = ord as i64;
+/// Kept only in the build state, not in the served database.
+const STATE_SCHEMA: &str = "CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
+/// How many of `wanted` the saved state covers, if a build can continue from
+/// it: same extraction code, and its releases are the first of `wanted`.
+fn resumable(state_path: &Path, wanted: &[&str]) -> Result<Option<usize>> {
+    if !state_path.exists() {
+        return Ok(None);
+    }
+    let db = Connection::open_with_flags(state_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let fingerprint: Option<String> = db
+        .query_row("SELECT value FROM build_meta WHERE key = 'fingerprint'", [], |r| {
+            r.get(0)
+        })
+        .ok();
+    if fingerprint.as_deref() != Some(FINGERPRINT) {
+        eprintln!(
+            "{} was built by other extraction code; building from scratch",
+            state_path.display()
+        );
+        return Ok(None);
+    }
+    let have = crate::verify::release_tags(state_path)?;
+    if have.is_empty() || have.len() > wanted.len() || have != wanted[..have.len()] {
+        eprintln!(
+            "{} covers other releases than this build; building from scratch",
+            state_path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(have.len()))
+}
+
+/// Everything carried from one release to the next.
+#[derive(Default)]
+struct State {
+    sig_ids: HashMap<String, i64>,
+    def_ids: HashMap<(String, Arc<str>), i64>,
+    /// (def, sig) -> the span still running at the last release added.
+    open: HashMap<(i64, i64), OpenSpan>,
+    /// Caches that only save work: a build that starts with them empty writes
+    /// the same rows.
+    cache: HashMap<Oid, Arc<Blob>>,
+    gen_memo: HashMap<MemoKey, Arc<Generated>>,
+    calls_memo: HashMap<MemoKey, Arc<Calls>>,
+    ever_functions: HashSet<String>,
+    /// (macro def, targets JSON) -> first version.
+    open_targets: HashMap<(i64, String), i64>,
+}
+
+impl State {
+    /// Picks up a state that covers releases up to `last_ord`. Rows still
+    /// running at `last_ord` move back into memory, to be written again when
+    /// they end.
+    fn resume(tx: &rusqlite::Transaction, last_ord: i64) -> Result<Self> {
+        let mut state = State::default();
+        let mut stmt = tx.prepare(
+            "SELECT id, kind, return_type, params, is_static, is_inline, attributes, body, generated_by, origin
+             FROM signatures",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let key = sig_key(
+                &r.get::<_, String>(1)?,
+                &r.get::<_, String>(2)?,
+                &r.get::<_, String>(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                &r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?.as_deref(),
+                r.get::<_, Option<String>>(8)?.as_deref(),
+                r.get::<_, Option<String>>(9)?.as_deref(),
+            );
+            state.sig_ids.insert(key, r.get(0)?);
+        }
+        drop(rows);
+        drop(stmt);
+
+        let mut stmt = tx.prepare("SELECT id, name, file FROM defs")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let file: String = r.get(2)?;
+            state.def_ids.insert((r.get(1)?, Arc::from(file)), r.get(0)?);
+        }
+        drop(rows);
+        drop(stmt);
+
+        // Names that were a function in any release so far.
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT d.name FROM defs d
+             JOIN spans s ON s.def_id = d.id
+             JOIN signatures g ON g.id = s.sig_id
+             WHERE g.kind != 'Macro'",
+        )?;
+        state.ever_functions = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        let mut stmt = tx.prepare("SELECT def_id, sig_id, first_ord, lines, origin FROM spans WHERE last_ord = ?1")?;
+        let mut rows = stmt.query([last_ord])?;
+        while let Some(r) = rows.next()? {
+            let lines: String = r.get(3)?;
+            let lines = lines
+                .split(',')
+                .map(|l| l.parse::<u32>().context("reading span lines"))
+                .collect::<Result<Vec<_>>>()?;
+            let span = OpenSpan {
+                first_ord: r.get(2)?,
+                lines,
+                origin: r.get(4)?,
+            };
+            state.open.insert((r.get(0)?, r.get(1)?), span);
+        }
+        drop(rows);
+        drop(stmt);
+        tx.execute("DELETE FROM spans WHERE last_ord = ?1", [last_ord])?;
+
+        let mut stmt =
+            tx.prepare("SELECT def_id, first_ord, primary_calls, other_calls FROM macro_targets WHERE last_ord = ?1")?;
+        let mut rows = stmt.query([last_ord])?;
+        while let Some(r) = rows.next()? {
+            let primary: Vec<String> = serde_json::from_str(&r.get::<_, String>(2)?)?;
+            let also: Vec<String> = serde_json::from_str(&r.get::<_, String>(3)?)?;
+            let json = serde_json::json!([primary, also]).to_string();
+            state.open_targets.insert((r.get(0)?, json), r.get(1)?);
+        }
+        drop(rows);
+        drop(stmt);
+        tx.execute("DELETE FROM macro_targets WHERE last_ord = ?1", [last_ord])?;
+
+        Ok(state)
+    }
+
+    fn add_version(
+        &mut self,
+        tx: &rusqlite::Transaction,
+        repo: &Repository,
+        repo_path: &Path,
+        ord: i64,
+        tag: &str,
+    ) -> Result<()> {
         let started = Instant::now();
         let commit = repo.revparse_single(tag)?.peel_to_commit()?;
         tx.execute(
@@ -278,7 +479,7 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         let mut new_blobs: Vec<Oid> = files
             .iter()
             .map(|(_, oid)| *oid)
-            .filter(|oid| !cache.contains_key(oid))
+            .filter(|oid| !self.cache.contains_key(oid))
             .collect();
         new_blobs.sort();
         new_blobs.dedup();
@@ -294,18 +495,19 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
                         name: f.name.clone(),
                         line: f.line,
                         kind: f.kind,
-                        sig_id: intern_sig(&tx, &mut sig_ids, &f)?,
+                        sig_id: intern_sig(tx, &mut self.sig_ids, &f)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
             next_cache.insert(oid, Arc::new(Blob { occurrences, facts }));
         }
         for (_, oid) in &files {
-            if let Some(blob) = cache.get(oid) {
+            if let Some(blob) = self.cache.get(oid) {
                 next_cache.entry(*oid).or_insert_with(|| blob.clone());
             }
         }
-        cache = next_cache;
+        self.cache = next_cache;
+        let cache = &self.cache;
         let parse_time = started.elapsed();
 
         let scope = {
@@ -314,6 +516,7 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         };
 
         // Functions generated by macro invocations, per file.
+        let gen_memo = &self.gen_memo;
         let generated: Vec<Vec<(MemoKey, Arc<Generated>, bool)>> = files
             .par_iter()
             .enumerate()
@@ -350,29 +553,30 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
                 if occ.kind == Kind::BpfCall && gen_at.contains(&(occ.name.as_str(), occ.line)) {
                     continue;
                 }
-                let def_id = def_id(&tx, &mut def_ids, &occ.name, path)?;
+                let def_id = def_id(tx, &mut self.def_ids, &occ.name, path)?;
                 current.entry((def_id, occ.sig_id)).or_insert((occ.line, None));
                 if occ.kind != Kind::Macro {
                     version_functions.insert(occ.name.clone());
                 }
             }
             for f in gen_fns {
-                let sig_id = intern_sig(&tx, &mut sig_ids, f)?;
-                let def_id = def_id(&tx, &mut def_ids, &f.name, path)?;
+                let sig_id = intern_sig(tx, &mut self.sig_ids, f)?;
+                let def_id = def_id(tx, &mut self.def_ids, &f.name, path)?;
                 current.entry((def_id, sig_id)).or_insert((f.line, f.origin.clone()));
                 version_functions.insert(f.name.clone());
                 generated_count += 1;
             }
         }
-        gen_memo = generated.into_iter().flatten().map(|(k, g, _)| (k, g)).collect();
+        self.gen_memo = generated.into_iter().flatten().map(|(k, g, _)| (k, g)).collect();
 
-        let ended: Vec<_> = open.keys().filter(|k| !current.contains_key(k)).copied().collect();
+        let ended: Vec<_> = self.open.keys().filter(|k| !current.contains_key(k)).copied().collect();
         for key in ended {
-            let span = open.remove(&key).expect("key taken from map");
-            write_span(&tx, key, &span, ord - 1)?;
+            let span = self.open.remove(&key).expect("key taken from map");
+            write_span(tx, key, &span, ord - 1)?;
         }
         for (key, (line, origin)) in current {
-            open.entry(key)
+            self.open
+                .entry(key)
                 .or_insert_with(|| OpenSpan {
                     first_ord: ord,
                     lines: Vec::new(),
@@ -383,12 +587,12 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
         }
 
         // What macros named like a function (now or earlier) call instead.
-        ever_functions.extend(version_functions.iter().cloned());
+        self.ever_functions.extend(version_functions.iter().cloned());
+        let ever = &self.ever_functions;
         let jobs: Vec<(usize, usize)> = files
             .iter()
             .enumerate()
             .flat_map(|(i, (_, oid))| {
-                let ever = &ever_functions;
                 cache[oid]
                     .facts
                     .macros
@@ -398,6 +602,7 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
                     .map(move |(k, _)| (i, k))
             })
             .collect();
+        let calls_memo = &self.calls_memo;
         let calls: Vec<(MemoKey, Arc<Calls>)> = jobs
             .par_iter()
             .map(|&(i, k)| {
@@ -416,11 +621,11 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
             let Some(found) = &c.calls else { continue };
             let name = &cache[oid].facts.macros[*k].name;
             let (primary, also) = generate::classify(found, |n| version_functions.contains(n));
-            let entry = targets.entry(def_id(&tx, &mut def_ids, name, path)?).or_default();
+            let entry = targets.entry(def_id(tx, &mut self.def_ids, name, path)?).or_default();
             entry.0.extend(primary);
             entry.1.extend(also);
         }
-        calls_memo = calls.into_iter().collect();
+        self.calls_memo = calls.into_iter().collect();
         let current_targets: HashSet<(i64, String)> = targets
             .into_iter()
             .map(|(def, (primary, also))| {
@@ -428,53 +633,41 @@ pub fn build(repo_path: &Path, db_path: &Path, opts: &Options) -> Result<()> {
                 (def, serde_json::json!([primary, also]).to_string())
             })
             .collect();
-        let ended: Vec<_> = open_targets
+        let ended: Vec<_> = self
+            .open_targets
             .keys()
             .filter(|k| !current_targets.contains(k))
             .cloned()
             .collect();
         for key in ended {
-            let first = open_targets.remove(&key).expect("key taken from map");
-            write_targets(&tx, &key, first, ord - 1)?;
+            let first = self.open_targets.remove(&key).expect("key taken from map");
+            write_targets(tx, &key, first, ord - 1)?;
         }
         for key in current_targets {
-            open_targets.entry(key).or_insert(ord);
+            self.open_targets.entry(key).or_insert(ord);
         }
 
         eprintln!(
             "{tag:>7}: {} files, {parsed_count} parsed ({:.1}s), {expanded} expanded, {generated_count} generated, {} defs live, {} signatures ({:.1}s)",
             files.len(),
             parse_time.as_secs_f32(),
-            open.len(),
-            sig_ids.len(),
+            self.open.len(),
+            self.sig_ids.len(),
             started.elapsed().as_secs_f32()
         );
+        Ok(())
     }
 
-    let last_ord = tags.len() as i64 - 1;
-    for (key, span) in &open {
-        write_span(&tx, *key, span, last_ord)?;
+    /// Writes the spans still running at `last_ord`.
+    fn finish(&self, tx: &rusqlite::Transaction, last_ord: i64) -> Result<()> {
+        for (key, span) in &self.open {
+            write_span(tx, *key, span, last_ord)?;
+        }
+        for (key, first) in &self.open_targets {
+            write_targets(tx, key, *first, last_ord)?;
+        }
+        Ok(())
     }
-    for (key, first) in &open_targets {
-        write_targets(&tx, key, *first, last_ord)?;
-    }
-    prune_macros(&tx)?;
-    tx.commit()?;
-    db.execute_batch("ANALYZE; VACUUM;")?;
-    drop(db);
-    if !opts.force
-        && let Err(e) = crate::verify::check_replacement(&tmp_path, Some(db_path))
-    {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.context(format!(
-            "kept {}: the new database failed its checks",
-            db_path.display()
-        )));
-    }
-    std::fs::rename(&tmp_path, db_path)?;
-    std::fs::remove_file(&attempt_path)?;
-    drop(lock);
-    Ok(())
 }
 
 /// Keeps a macro only when its name is a real function somewhere in the
@@ -538,14 +731,39 @@ fn parse_blobs(repo_path: &Path, oids: &[Oid]) -> Result<Vec<(Oid, FileFacts)>> 
         .collect()
 }
 
+/// Identifies a signature by every column of its row.
+#[allow(clippy::too_many_arguments)]
+fn sig_key(
+    kind: &str,
+    return_type: &str,
+    params_json: &str,
+    is_static: bool,
+    is_inline: bool,
+    attrs_json: &str,
+    body: Option<&str>,
+    generated_by: Option<&str>,
+    origin: Option<&str>,
+) -> String {
+    format!(
+        "{kind}\0{return_type}\0{params_json}\0{is_static}\0{is_inline}\0{attrs_json}\0{body:?}\0{generated_by:?}\0{origin:?}"
+    )
+}
+
 fn intern_sig(tx: &rusqlite::Transaction, ids: &mut HashMap<String, i64>, f: &Function) -> Result<i64> {
     let kind = format!("{:?}", f.kind);
     let params_json = serde_json::to_string(&f.params)?;
     let attrs_json = serde_json::to_string(&f.attributes)?;
     let origin = origin_files(f.origin.as_deref());
-    let key = format!(
-        "{kind}\0{}\0{params_json}\0{}\0{}\0{attrs_json}\0{:?}\0{:?}\0{:?}",
-        f.return_type, f.is_static, f.is_inline, f.body, f.generated_by, origin
+    let key = sig_key(
+        &kind,
+        &f.return_type,
+        &params_json,
+        f.is_static,
+        f.is_inline,
+        &attrs_json,
+        f.body.as_deref(),
+        f.generated_by.as_deref(),
+        origin.as_deref(),
     );
     if let Some(&id) = ids.get(&key) {
         return Ok(id);
