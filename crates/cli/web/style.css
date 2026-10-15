@@ -253,8 +253,12 @@ main {
 .changes .added::before { content: "+"; color: var(--added); }
 .changes .removed::before { content: "−"; color: var(--removed); }
 .changes .changed::before { content: "~"; color: var(--changed); }
+.changes .neutral { color: var(--muted); }
+.changes .neutral::before { content: "="; color: var(--muted); }
+.changes code.explained { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
 .changes code { font: 0.9375rem var(--mono); }
 .first-seen { font-size: 1rem; color: var(--muted); margin: 6px 0 0; }
+.first-seen code, .gone code { font: 0.9375rem var(--mono); }
 .gone { font-size: 1rem; font-weight: 500; color: var(--removed); margin: 6px 0 0; }
 .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .tag {

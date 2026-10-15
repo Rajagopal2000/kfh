@@ -122,7 +122,12 @@ fn show(name: &str, db: &PathBuf, json: bool) -> Result<()> {
                 println!("    {:>14}  ~ moved here from {from}", "");
             }
             for c in &span.changes {
-                println!("    {:>14}  ~ {}", "", describe(c));
+                let note = if c.affects_probes() {
+                    ""
+                } else {
+                    " (does not affect probes on x86-64 or arm64)"
+                };
+                println!("    {:>14}  ~ {}{note}", "", describe(c));
             }
             let mut extras = Vec::new();
             if span.signature.is_static {
@@ -162,8 +167,8 @@ fn describe(c: &Change) -> String {
         Change::ParamsReordered => "params reordered".into(),
         Change::StaticChanged { to } => (if *to { "became static" } else { "no longer static" }).into(),
         Change::InlineChanged { to } => (if *to { "became inline" } else { "no longer inline" }).into(),
-        Change::AttributeAdded { name } => format!("gained `{name}`"),
-        Change::AttributeRemoved { name } => format!("lost `{name}`"),
+        Change::AttributeAdded { name } => format!("`{name}` added"),
+        Change::AttributeRemoved { name } => format!("`{name}` removed"),
         Change::KindChanged { to, .. } if to == query::MACRO => "became a macro".into(),
         Change::KindChanged { from, .. } if from == query::MACRO => "became a function".into(),
         Change::KindChanged { from, to } => format!("kind `{from}` -> `{to}`"),

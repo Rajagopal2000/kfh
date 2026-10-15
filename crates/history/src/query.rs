@@ -180,6 +180,37 @@ pub enum Change {
     },
 }
 
+/// Annotations that change neither the symbol nor how its arguments are
+/// passed on x86-64 and arm64, checked against their definitions in v4.0
+/// and v7.2. Anything not listed is treated as able to affect a probe.
+pub const PROBE_NEUTRAL: &[&str] = &[
+    "asmlinkage",
+    "__must_check",
+    "__printf",
+    "__maybe_unused",
+    "__always_unused",
+    "__releases",
+    "__acquires",
+    "__must_hold",
+    "__cond_acquires",
+    "__sched",
+    "__no_kcsan",
+    "__no_sanitize_address",
+];
+
+impl Change {
+    /// Whether the change can matter to a probe on x86-64 or arm64.
+    pub fn affects_probes(&self) -> bool {
+        match self {
+            Change::AttributeAdded { name } | Change::AttributeRemoved { name } => {
+                !PROBE_NEUTRAL.contains(&name.as_str())
+            }
+            Change::OriginChanged { .. } => false,
+            _ => true,
+        }
+    }
+}
+
 pub fn versions(db: &Connection) -> Result<Vec<Version>> {
     let mut stmt = db.prepare("SELECT ord, tag, commit_time FROM versions ORDER BY ord")?;
     let rows = stmt.query_map([], |r| {
