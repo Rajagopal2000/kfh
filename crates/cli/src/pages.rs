@@ -412,7 +412,10 @@ fn description(name: &str, defs: &[DefHistory], versions: &[Version], summary: &
         .flat_map(|d| d.spans.iter())
         .max_by_key(|s| (s.last_ord, s.first_ord))
         .map(|s| s.signature.render(name));
-    let mut d = format!("History of {name} in the Linux kernel, {}. {summary}", range_text(versions));
+    let mut d = format!(
+        "History of {name} in the Linux kernel, {}. {summary}",
+        range_text(versions)
+    );
     if let Some(sig) = newest {
         d += &format!(" Latest: {sig}");
     }
